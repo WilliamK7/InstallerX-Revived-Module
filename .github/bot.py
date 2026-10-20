@@ -1,117 +1,138 @@
-from telethon import TelegramClient, sessions
-import asyncio
+"""Send one AOSP APK or a status message to one configured Telegram private chat."""
+
+import argparse
+import json
 import os
+from pathlib import Path
+import re
+import secrets
 import sys
+from urllib import error, parse, request
 
-# --- Environment Variables ---
-API_ID = os.environ.get("API_ID")
-API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-_chat_id_raw = os.environ.get("CHAT_ID", "")
-BOT_CI_SESSION = os.environ.get("BOT_CI_SESSION")
 
-# Parse CHAT_ID - support both numeric IDs and usernames
-if _chat_id_raw:
-    # If it starts with @ or is not numeric, treat as username
-    if _chat_id_raw.startswith('@') or not _chat_id_raw.lstrip('-').isdigit():
-        CHAT_ID = _chat_id_raw
+MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
+
+
+def call_api(token, method, fields, apk=None):
+    if apk is None:
+        body = parse.urlencode(fields).encode("utf-8")
+        content_type = "application/x-www-form-urlencoded"
     else:
-        CHAT_ID = int(_chat_id_raw)
-else:
-    CHAT_ID = None
-
-async def send_telegram_files(files):
-    """
-    Connects to Telegram and sends the specified files as a group message.
-    """
-    # Filter out empty file paths
-    files = [f for f in files if f and os.path.exists(f)]
-
-    if not files:
-        print("[-] No valid files to upload")
-        return
-
-    session = sessions.StringSession(BOT_CI_SESSION)
-
-    async with TelegramClient(session, api_id=API_ID, api_hash=API_HASH) as client:
-        # Start the client with the bot token
-        await client.start(bot_token=BOT_TOKEN)
-
-        print(f"[+] Sending {len(files)} file(s) as a group...")
-        print(f"[+] Target chat: {CHAT_ID}")
-
-        # Send the files together as an album/group
-        await client.send_file(
-            entity=CHAT_ID,
-            file=files,
+        boundary = secrets.token_hex(24)
+        parts = []
+        for name, value in fields.items():
+            parts.append(
+                (
+                    f"--{boundary}\r\n"
+                    f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                    f"{value}\r\n"
+                ).encode("utf-8")
+            )
+        parts.extend(
+            [
+                (
+                    f"--{boundary}\r\n"
+                    'Content-Disposition: form-data; name="document"; '
+                    'filename="PackageInstaller.apk"\r\n'
+                    "Content-Type: application/vnd.android.package-archive\r\n\r\n"
+                ).encode("utf-8"),
+                apk.read_bytes(),
+                f"\r\n--{boundary}--\r\n".encode("utf-8"),
+            ]
         )
-        print("[+] Files sent successfully.")
+        body = b"".join(parts)
+        content_type = f"multipart/form-data; boundary={boundary}"
+
+    api_request = request.Request(
+        f"https://api.telegram.org/bot{token}/{method}",
+        data=body,
+        headers={"Content-Type": content_type},
+        method="POST",
+    )
+    try:
+        with request.urlopen(api_request, timeout=300) as response:
+            payload = json.load(response)
+    except error.HTTPError as exc:
+        # HTTP exception URLs contain the bot token. Never print them or a traceback.
+        raise RuntimeError(
+            f"Telegram {method} failed (HTTP {exc.code}). "
+            "Check BOT_TOKEN, CHAT_ID, /start and whether the bot is blocked."
+        ) from None
+    except (error.URLError, TimeoutError, OSError):
+        raise RuntimeError(f"Telegram {method} failed: network connection error.") from None
+    except ValueError:
+        raise RuntimeError(f"Telegram {method} returned invalid JSON.") from None
+
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        raise RuntimeError(f"Telegram rejected {method}; check the bot configuration.")
+    return payload.get("result")
 
 
-async def send_telegram_text(text, target):
-    """
-    Sends a plain text message to the specified user or chat.
-    """
-    session = sessions.StringSession(BOT_CI_SESSION)
-
-    async with TelegramClient(session, api_id=API_ID, api_hash=API_HASH) as client:
-        # Start the client with the bot token
-        await client.start(bot_token=BOT_TOKEN)
-
-        print(f"[+] Sending text message to: {target}")
-        await client.send_message(entity=target, message=text)
-        print("[+] Message sent successfully.")
+def private_chat(token, chat_id):
+    chat = call_api(token, "getChat", {"chat_id": chat_id})
+    if (
+        not isinstance(chat, dict)
+        or chat.get("type") != "private"
+        or chat.get("id") != chat_id
+    ):
+        raise RuntimeError("CHAT_ID must identify your private chat; groups and channels are not allowed.")
+    return chat_id
 
 
-if __name__ == '__main__':
-    args = sys.argv[1:]
-    if not args:
-        print("[-] No arguments provided.")
-        sys.exit(1)
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("apk", nargs="?", help="Path to the AOSP PackageInstaller APK")
+    parser.add_argument("--caption", default="", help="Optional APK caption")
+    parser.add_argument("--text", help="Send a plain status message")
+    parser.add_argument("--check", action="store_true", help="Validate the private chat without sending")
+    args = parser.parse_args(argv)
+    if sum((args.apk is not None, args.text is not None, args.check)) != 1:
+        parser.error("choose exactly one APK path, --text, or --check")
+    if args.caption and not args.apk:
+        parser.error("--caption requires an APK path")
+    if args.text is not None and not args.text.strip():
+        parser.error("--text must not be empty")
+    if len(args.caption) > 1024 or (args.text is not None and len(args.text) > 4096):
+        parser.error("caption or message exceeds Telegram's length limit")
 
-    # Text message mode: bot.py --text "message" [--to user_or_chat_id]
-    if args[0] == '--text':
-        text = None
-        target = CHAT_ID
-        i = 1
-        while i < len(args):
-            if args[i] == '--to':
-                raw = args[i + 1] if i + 1 < len(args) else None
-                if raw is not None:
-                    if raw.lstrip('-').isdigit():
-                        target = int(raw)
-                    else:
-                        target = raw
-                i += 2
-            else:
-                text = args[i]
-                i += 1
-        if not text:
-            print("[-] No text message provided.")
-            sys.exit(1)
-        if target is None:
-            print("[-] Target not set, cannot send message")
-            sys.exit(1)
-        try:
-            asyncio.run(send_telegram_text(text, target))
-        except Exception as e:
-            print(f"[-] An error occurred: {e}")
-            import traceback
-            traceback.print_exc()
-            sys.exit(1)
-    # File upload mode (backward compatible)
+    token = os.environ.get("BOT_TOKEN", "").strip()
+    raw_chat_id = os.environ.get("CHAT_ID", "").strip()
+    if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token):
+        raise RuntimeError("BOT_TOKEN is missing or malformed.")
+    if not re.fullmatch(r"[1-9][0-9]*", raw_chat_id):
+        raise RuntimeError("CHAT_ID must be your positive numeric private-chat ID, not a username or group ID.")
+
+    apk = Path(args.apk) if args.apk else None
+    if apk is not None:
+        if not apk.is_file() or apk.suffix.lower() != ".apk":
+            raise RuntimeError("The APK file does not exist or has the wrong extension.")
+        if not 0 < apk.stat().st_size <= MAX_DOCUMENT_BYTES:
+            raise RuntimeError("The APK must be nonempty and no larger than the Bot API's 50 MB limit.")
+
+    chat_id = private_chat(token, int(raw_chat_id))
+    if args.check:
+        print("Telegram private-chat configuration is valid.")
+    elif args.text is not None:
+        call_api(token, "sendMessage", {"chat_id": chat_id, "text": args.text})
+        print("Status message sent to the configured private chat.")
     else:
-        if CHAT_ID is None:
-            print("[-] CHAT_ID is not set, cannot send files")
-            sys.exit(1)
-        # Get all file paths from command-line arguments
-        apk_files = args
-        print(f"[+] Found files to upload: {apk_files}")
-        try:
-            # Run the asynchronous function
-            asyncio.run(send_telegram_files(apk_files))
-        except Exception as e:
-            print(f"[-] An error occurred: {e}")
-            import traceback
-            traceback.print_exc()
-            sys.exit(1)
+        call_api(
+            token,
+            "sendDocument",
+            {"chat_id": chat_id, "caption": args.caption},
+            apk=apk,
+        )
+        print("AOSP APK sent to the configured private chat.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (RuntimeError, OSError, ValueError) as exc:
+        # Redact defensively and avoid tracebacks containing a credential-bearing URL.
+        message = str(exc)
+        token = os.environ.get("BOT_TOKEN", "").strip()
+        if token:
+            message = message.replace(token, "[redacted]")
+        print(f"ERROR: {message}", file=sys.stderr)
+        sys.exit(1)

@@ -1,54 +1,93 @@
-name: Manual Stable Release
+name: Manual AOSP Build
 
 on:
   workflow_dispatch:
-    inputs:
-      merge_upstream:
-        description: 'Merge from upstream before building'
-        type: boolean
-        default: true
-  schedule:
-    # 每天北京时间晚上8点 (UTC 12:00)
-    - cron: '0 12 * * *'
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: manual-aosp-build
+  cancel-in-progress: false
 
 jobs:
-  build_and_release:
-    name: Build Draft Release
+  build_and_send:
+    name: Build AOSP APK and send to private chat
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      packages: read
+    timeout-minutes: 60
+    env:
+      TZ: Asia/Shanghai
 
     steps:
-      - name: Checkout code
+      - name: Checkout fork
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Merge upstream
-        if: ${{ github.event_name == 'schedule' || inputs.merge_upstream }}
+      - name: Validate Telegram private chat
+        id: telegram
         env:
-          API_ID: ${{ secrets.API_ID }}
-          API_HASH: ${{ secrets.API_HASH }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          BOT_CI_SESSION: ${{ secrets.BOT_CI_SESSION }}
-          MY_CHAT_ID: ${{ secrets.MY_CHAT_ID }}
+        run: python3 .github/bot.py --check
+
+      - name: Validate signing configuration
+        env:
+          SIGNING_KEY_STORE_BASE64: ${{ secrets.SIGNING_KEY_STORE_BASE64 }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
+          python3 - <<'PY'
+          import os
+
+          names = (
+              "SIGNING_KEY_STORE_BASE64",
+              "SIGNING_STORE_PASSWORD",
+              "SIGNING_KEY_ALIAS",
+              "SIGNING_KEY_PASSWORD",
+          )
+          missing = [name for name in names if not os.environ.get(name)]
+          if missing:
+              raise SystemExit(
+                  "Missing GitHub Actions secrets: " + ", ".join(missing)
+                  + ". See README.md for the one-time signing setup."
+              )
+          PY
+
+      - name: Merge upstream application code
+        id: upstream
+        run: |
+          set -euo pipefail
+          FORK_SHA=$(git rev-parse HEAD)
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/wxxsfxyzm/InstallerX-Revived.git
-          git fetch upstream main
-          echo "Merging upstream/main into current branch..."
-          if ! git merge upstream/main --no-edit; then
-            echo "❌ Merge conflict detected! Please resolve conflicts locally and try again."
+          git fetch --no-tags upstream main
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          echo "sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+
+          # Merge only in this runner. Do not push changes back to the fork.
+          MERGE_STATUS=0
+          git merge --no-commit --no-ff upstream/main || MERGE_STATUS=$?
+
+          # Keep this fork's workflows and private-chat sender, including deletions.
+          # Upstream automation changes must not replace the personal build setup.
+          git restore --source="$FORK_SHA" --staged --worktree -- .github/
+
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+            echo "::error::Upstream application code has merge conflicts. Resolve them in the fork before retrying."
+            git diff --name-only --diff-filter=U
             git merge --abort
-            # 通知维护者合并冲突
-            pip3 install telethon >/dev/null 2>&1 || true
-            python3 .github/bot.py --text "❌ InstallerX-Revived-Module 合并上游冲突，请手动处理！" --to "${MY_CHAT_ID}" || echo "Failed to send Telegram notification"
             exit 1
           fi
-          echo "✅ Successfully merged upstream/main"
+          if [ "$MERGE_STATUS" -ne 0 ] && ! git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            echo "::error::Upstream merge failed."
+            exit 1
+          fi
+          echo "Upstream source: $UPSTREAM_SHA" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up JDK 25
         uses: actions/setup-java@v6
@@ -59,190 +98,117 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v6
         with:
-          # Accept the terms of use to suppress the caching licensing warning
           build-scan-terms-of-use-url: "https://gradle.com/help/legal-terms-of-use"
           build-scan-terms-of-use-agree: "yes"
           build-scan-publish: false
-          # Cache is read-only for manual stable releases
           cache-read-only: true
 
-      - name: Verify Keystore
-        run: |
-          if [ -z "${{ secrets.SIGNING_KEY_STORE_BASE64 }}" ]; then
-            echo "ERROR: SIGNING_KEY_STORE_BASE64 secret is missing"
-            exit 1
-          fi
-
-      - name: Setup Signing Keys
+      - name: Decode and validate signing key
         env:
           SIGNING_KEY_STORE_BASE64: ${{ secrets.SIGNING_KEY_STORE_BASE64 }}
           SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
           SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
-          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
-          if [ -z "${SIGNING_STORE_PASSWORD:-}" ] || [ -z "${SIGNING_KEY_STORE_BASE64:-}" ] || [ -z "${SIGNING_KEY_PASSWORD:-}" ] || [ -z "${SIGNING_KEY_ALIAS:-}" ]; then
-            exit 0
+          set -euo pipefail
+          umask 077
+          if [ -e keystore.properties ]; then
+            echo "::error::Unexpected keystore.properties; refusing to override personal signing."
+            exit 1
           fi
-          mkdir -p keystore
-          echo "${SIGNING_KEY_STORE_BASE64}" | base64 --decode > keystore/carlyu.jks
-          echo "storeFile=keystore/carlyu.jks" > keystore.properties
-          echo "keyAlias=${SIGNING_KEY_ALIAS}" >> keystore.properties
-          echo "keyPassword=${SIGNING_KEY_PASSWORD}" >> keystore.properties
-          echo "storePassword=${SIGNING_STORE_PASSWORD}" >> keystore.properties
+          printf '%s' "$SIGNING_KEY_STORE_BASE64" | base64 --decode > "$RUNNER_TEMP/installerx-signing.jks"
+          keytool -list \
+            -keystore "$RUNNER_TEMP/installerx-signing.jks" \
+            -storepass:env SIGNING_STORE_PASSWORD \
+            -alias "$SIGNING_KEY_ALIAS" >/dev/null
 
-      - name: Grant execute permission for gradlew
-        run: chmod +x ./gradlew
-
-      - name: Set Version
+      - name: Set version
         id: version
         run: |
-          # 使用日期生成 version code: YYYYMMDD 格式
-          # 例如 2026-08-09 -> 20260809
-          VERSION_CODE=$(date +%Y%m%d)
-          BUILD_DATE=$(date +%Y%m%d)
+          python3 - <<'PY'
+          from datetime import datetime
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+          import os
+          import re
 
-          # Version name 格式: 固定 tag (日期)
-          # 例如: 222222.33 (20260809)
-          VERSION_TAG="222222.33"
-          VERSION_NAME="${VERSION_TAG} (${BUILD_DATE})"
+          # Retain the fork's existing version format, using the user's timezone.
+          build_date = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d")
+          version_name = f"222222.33 ({build_date})"
+          path = Path("app/build.gradle.kts")
+          source = path.read_text(encoding="utf-8")
+          for key, value in (
+              ("versionCode", build_date),
+              ("versionName", f'"{version_name}"'),
+          ):
+              source, count = re.subn(
+                  rf"(?m)^([ \t]*){key}[ \t]*=[^\r\n]*$",
+                  lambda match: f"{match[1]}{key} = {value}",
+                  source,
+              )
+              if count != 1:
+                  raise SystemExit(f"Expected exactly one {key} assignment; review upstream build configuration.")
+          path.write_text(source, encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"version_name={version_name}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(f"APK version: {version_name} [Code: {build_date}]\n")
+          PY
 
-          echo "本次 Version Name: $VERSION_NAME"
-          echo "本次 Version Code: $VERSION_CODE"
-
-          # 写入 build.gradle.kts（替换函数调用为数字字面量）
-          perl -pi -e "s/versionCode\s*=\s*.+/versionCode = $VERSION_CODE/g" app/build.gradle.kts
-          perl -pi -e 's/versionName\s*=\s*.+/versionName = "'"$VERSION_NAME"'"/g' app/build.gradle.kts
-
-          # 输出版本号供后续步骤使用
-          echo "version_name=$VERSION_NAME" >> $GITHUB_OUTPUT
-          echo "version_code=$VERSION_CODE" >> $GITHUB_OUTPUT
-
-          # 在日志中醒目显示版本号
-          echo "=============================================="
-          echo "  APK 版本号: ${VERSION_NAME} [Code: ${VERSION_CODE}]"
-          echo "=============================================="
-          echo "apk_version=${VERSION_NAME} [Code: ${VERSION_CODE}]" >> $GITHUB_STEP_SUMMARY
-
-      - name: Build Stable Release APKs
+      - name: Build AOSP Stable APK
         env:
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEYSTORE_FILE: ${{ runner.temp }}/installerx-signing.jks
+          KEYSTORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
-          set -e
-          echo "Building APK with package: com.android.packageinstaller"
-          ./gradlew assembleStableRelease -PAPP_ID=com.android.packageinstaller -Porg.gradle.java.installations.auto-download=false
+          chmod +x ./gradlew
+          ./gradlew assembleStableRelease \
+            -PAPP_ID=com.android.packageinstaller \
+            -Porg.gradle.java.installations.auto-download=false
 
-          # 定位 Stable 变体的 APK 输出目录
-          APK_DIR=$(find app/build/outputs/apk -type d | grep -iE '/stable/release$' | head -n 1)
-          if [ -z "$APK_DIR" ]; then
-            echo "ERROR: Stable APK output directory not found"
-            find app/build/outputs/apk -type d
-            exit 1
-          fi
-          echo "APK output directory: $APK_DIR"
-
-          # 备份第一个 APK (保存到 build 目录之外以避免被 clean 删除)
-          mkdir -p /tmp/apk-backup
-          ORIGINAL_APK=$(find "$APK_DIR" -maxdepth 1 -type f -name "*.apk" | head -n 1)
-          if [ -z "$ORIGINAL_APK" ]; then
-            echo "ERROR: AOSP APK not found in $APK_DIR"
-            ls -lah "$APK_DIR"
-            exit 1
-          fi
-          cp "$ORIGINAL_APK" /tmp/apk-backup/android.apk
-
-          echo "Building APK with package: com.google.android.packageinstaller"
-          ./gradlew clean assembleStableRelease -PAPP_ID=com.google.android.packageinstaller -Porg.gradle.java.installations.auto-download=false
-
-          # 重新定位输出目录并恢复第一个 APK
-          APK_DIR=$(find app/build/outputs/apk -type d | grep -iE '/stable/release$' | head -n 1)
-          cp /tmp/apk-backup/android.apk "$APK_DIR/temp-android.apk"
-
-      - name: Find and Rename APKs
-        id: rename_apk
+      - name: Collect AOSP APK
+        id: apk
         run: |
-          set -e
-          APK_DIR=$(find app/build/outputs/apk -type d | grep -iE '/stable/release$' | head -n 1)
-          if [ -z "$APK_DIR" ]; then
-            echo "ERROR: Stable APK output directory not found"
-            find app/build/outputs/apk -type d
-            exit 1
-          fi
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import shutil
 
-          # 重命名两个 APK
-          if [ -f "${APK_DIR}/temp-android.apk" ]; then
-            ANDROID_APK="${APK_DIR}/PackageInstaller.apk"
-            mv "${APK_DIR}/temp-android.apk" "$ANDROID_APK"
-            echo "Android APK: $ANDROID_APK"
-            echo "android_apk=${ANDROID_APK}" >> $GITHUB_OUTPUT
-          else
-            echo "ERROR: Android APK not found!"
-            exit 1
-          fi
+          apks = [
+              path for path in Path("app/build/outputs/apk").rglob("*.apk")
+              if path.parent.name.lower() == "release"
+              and path.parent.parent.name.lower() == "stable"
+          ]
+          if len(apks) != 1:
+              raise SystemExit(f"Expected exactly one AOSP Stable APK, found {len(apks)}.")
+          destination = Path(os.environ["RUNNER_TEMP"]) / "PackageInstaller.apk"
+          shutil.copyfile(apks[0], destination)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"path={destination}\n")
+          PY
 
-          # 查找 Google APK（第二次构建的结果）
-          GOOGLE_APK_ORIGINAL=$(find "$APK_DIR" -maxdepth 1 -type f -name "*.apk" ! -name "PackageInstaller.apk" | head -n 1)
-
-          if [ -n "$GOOGLE_APK_ORIGINAL" ]; then
-            GOOGLE_APK="${APK_DIR}/GooglePackageInstaller.apk"
-            mv "$GOOGLE_APK_ORIGINAL" "$GOOGLE_APK"
-            echo "Google APK: $GOOGLE_APK"
-            echo "google_apk=${GOOGLE_APK}" >> $GITHUB_OUTPUT
-          else
-            echo "ERROR: Google APK not found!"
-            ls -lah "$APK_DIR"
-            exit 1
-          fi
-
-      - name: Build Magisk Modules
-        id: modules
-        run: |
-          set -e
-          MODULE_VERSION_NAME="${{ steps.version.outputs.version_name }}"
-          MODULE_VERSION_CODE="${{ steps.version.outputs.version_code }}"
-          ANDROID_APK="${{ steps.rename_apk.outputs.android_apk }}"
-          GOOGLE_APK="${{ steps.rename_apk.outputs.google_apk }}"
-          REPO_URL="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
-
-          echo "Cloning AOSP module template..."
-          git clone --depth 1 --branch AOSP "$REPO_URL" /tmp/module-aosp
-          rm -rf /tmp/module-aosp/.git
-          mkdir -p /tmp/module-aosp/system/priv-app/PackageInstaller/lib
-          mkdir -p /tmp/module-aosp/system/priv-app/PackageInstaller/oat
-          cp "$ANDROID_APK" /tmp/module-aosp/system/priv-app/PackageInstaller/
-          perl -pi -e "s/^version=.*/version=$MODULE_VERSION_NAME/" /tmp/module-aosp/module.prop
-          perl -pi -e "s/^versionCode=.*/versionCode=$MODULE_VERSION_CODE/" /tmp/module-aosp/module.prop
-
-          echo "Cloning google module template..."
-          git clone --depth 1 --branch google "$REPO_URL" /tmp/module-google
-          rm -rf /tmp/module-google/.git
-          mkdir -p /tmp/module-google/system/priv-app/GooglePackageInstaller/lib
-          mkdir -p /tmp/module-google/system/priv-app/GooglePackageInstaller/oat
-          cp "$GOOGLE_APK" /tmp/module-google/system/priv-app/GooglePackageInstaller/
-          perl -pi -e "s/^version=.*/version=$MODULE_VERSION_NAME/" /tmp/module-google/module.prop
-          perl -pi -e "s/^versionCode=.*/versionCode=$MODULE_VERSION_CODE/" /tmp/module-google/module.prop
-
-          echo "Packing AOSP module zip..."
-          cd /tmp/module-aosp
-          zip -r9 /tmp/InstallerX-Revived-AOSP.zip *
-
-          echo "Packing google module zip..."
-          cd /tmp/module-google
-          zip -r9 /tmp/InstallerX-Revived-Google.zip *
-
-          echo "aosp_zip=/tmp/InstallerX-Revived-AOSP.zip" >> $GITHUB_OUTPUT
-          echo "google_zip=/tmp/InstallerX-Revived-Google.zip" >> $GITHUB_OUTPUT
-          ls -lah /tmp/InstallerX-Revived-*.zip
-
-      - name: Upload to Telegram
-        continue-on-error: true
+      - name: Send APK to Telegram private chat
         env:
-          API_ID: ${{ secrets.API_ID }}
-          API_HASH: ${{ secrets.API_HASH }}
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          BOT_CI_SESSION: ${{ secrets.BOT_CI_SESSION }}
+          APK_PATH: ${{ steps.apk.outputs.path }}
+          VERSION_NAME: ${{ steps.version.outputs.version_name }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
         run: |
-          pip3 install telethon
-          echo "Uploading APKs and module zips as a group..."
-          python3 .github/bot.py "${{ steps.rename_apk.outputs.android_apk }}" "${{ steps.rename_apk.outputs.google_apk }}" "${{ steps.modules.outputs.aosp_zip }}" "${{ steps.modules.outputs.google_zip }}"
+          python3 .github/bot.py "$APK_PATH" \
+            --caption "InstallerX AOSP | $VERSION_NAME | upstream $UPSTREAM_SHA"
+
+      - name: Notify private chat of failure
+        if: ${{ failure() && steps.telegram.outcome == 'success' }}
+        continue-on-error: true
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 .github/bot.py --text "InstallerX AOSP 构建或发送失败，请查看日志：$RUN_URL"
+
+      - name: Remove signing material
+        if: ${{ always() }}
+        run: rm -f -- "$RUNNER_TEMP/installerx-signing.jks"

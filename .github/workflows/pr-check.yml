@@ -26,7 +26,7 @@ jobs:
       - name: Check PR target branch
         if: >
           github.event.pull_request.base.ref == 'main' &&
-          github.event.pull_request.user.login != 'wxxsfxyzm'
+          github.event.pull_request.user.login != github.repository_owner
         run: |
           echo "::error::External pull requests must target the 'dev' branch."
           echo "Please change the base branch from 'main' to 'dev'. You do not need to recreate the pull request."
