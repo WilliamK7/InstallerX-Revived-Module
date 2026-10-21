@@ -33,7 +33,8 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: python3 .github/bot.py --check
 
-      - name: Validate signing configuration
+      - name: Select signing mode
+        id: signing
         env:
           SIGNING_KEY_STORE_BASE64: ${{ secrets.SIGNING_KEY_STORE_BASE64 }}
           SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
@@ -49,12 +50,21 @@ jobs:
               "SIGNING_KEY_ALIAS",
               "SIGNING_KEY_PASSWORD",
           )
+          configured = [name for name in names if os.environ.get(name)]
           missing = [name for name in names if not os.environ.get(name)]
-          if missing:
+          if configured and missing:
               raise SystemExit(
-                  "Missing GitHub Actions secrets: " + ", ".join(missing)
-                  + ". See README.md for the one-time signing setup."
+                  "Incomplete custom signing configuration: " + ", ".join(missing)
+                  + ". Complete all four secrets, or remove all SIGNING_* secrets "
+                  "to use automatic debug signing."
               )
+          custom = bool(configured)
+          mode = "custom signing" if custom else "automatic debug signing (no signing secrets needed)"
+          print(f"Using {mode}.")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"custom={'true' if custom else 'false'}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(f"Signing: {mode}\n")
           PY
 
       - name: Merge upstream application code
@@ -104,6 +114,7 @@ jobs:
           cache-read-only: true
 
       - name: Decode and validate signing key
+        if: ${{ steps.signing.outputs.custom == 'true' }}
         env:
           SIGNING_KEY_STORE_BASE64: ${{ secrets.SIGNING_KEY_STORE_BASE64 }}
           SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
@@ -156,6 +167,7 @@ jobs:
 
       - name: Build AOSP Stable APK
         env:
+          CUSTOM_SIGNING: ${{ steps.signing.outputs.custom }}
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KEYSTORE_FILE: ${{ runner.temp }}/installerx-signing.jks
@@ -163,6 +175,11 @@ jobs:
           KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: |
+          # Empty environment variables still count as custom signing in Gradle.
+          # Unset all four to use the project's existing debug-keystore fallback.
+          if [ "$CUSTOM_SIGNING" != "true" ]; then
+            unset KEYSTORE_FILE KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD
+          fi
           chmod +x ./gradlew
           ./gradlew assembleStableRelease \
             -PAPP_ID=com.android.packageinstaller \

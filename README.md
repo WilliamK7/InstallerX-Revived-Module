@@ -10,6 +10,10 @@
 
 ## 第一次使用
 
+**只需配置 `BOT_TOKEN` 和 `CHAT_ID` 两个 Secrets，然后手动运行工作流。无需自己生成签名密钥。**
+
+不填写任何 `SIGNING_*` Secrets 时，Gradle 自动使用构建环境的 debug 签名。APK 仍按 Stable Release 构建，保留原有优化设置；不同运行之间不保证签名一致。
+
 ### 1. 配置 Telegram
 
 创建自己的 Bot，先打开与它的私聊并发送 `/start`。准备 Bot Token 和你自己的**正整数个人 Chat ID**。
@@ -24,7 +28,36 @@
 脚本先通过 Telegram `getChat` 确认目标是私聊，再向同一个 ID 发送 APK 或失败通知。只配置一个收件人。
 不再需要 `API_ID`、`API_HASH`、`BOT_CI_SESSION` 或 `MY_CHAT_ID`。
 
-### 2. 一次性准备 APK 签名密钥
+### 2. 手动构建
+
+1. 打开本仓库的 **Actions**。如果 fork 的工作流尚未启用，按 GitHub 的提示启用。
+2. 选择 **Manual AOSP Build → Run workflow**，选择 `main` 并运行。
+3. 等待上游合并和构建完成。Bot 会把 `PackageInstaller.apk` 发到你的私聊，附带版本和上游提交号。
+4. Telegram 配置验证成功后，如果后续合并、签名、构建或发送失败，会尽力向同一个私聊发送日志链接；发送失败会让工作流显示失败。
+
+无需手动创建发布或模块模板分支。
+
+## 上游同步与版本
+
+合并仅发生在本次 Actions 的工作目录，不会自动提交或推送到你的 `main`。
+应用源码按 Git 的正常合并规则更新；本 fork 的 `.github/` 自动化配置始终保留，包括已删除的自动发布工作流。
+其他路径发生冲突时立即停止，需要先在 fork 中解决冲突再运行，不会继续用旧源码构建。
+
+沿用原 fork 的版本格式：`222222.33 (YYYYMMDD)`，versionCode 为 `YYYYMMDD`，日期使用北京时间。
+两次同日构建使用相同的 versionCode；原工作流也是这一规则。
+最新上游源码按 Stable 构建类型编译，并不表示这些上游提交已经通过正式稳定版发布验证。
+
+## 常见问题
+
+- **Bot 无法联系你：** 确认你已私聊发送 `/start`，没有屏蔽 Bot，且 `CHAT_ID` 是自己的个人 ID。
+- **APK 太大：** 当前使用 Telegram 官方托管 Bot API，单个文件最多 50 MB。超过限制会明确失败，不会改为投递到其他地方。
+- **依赖下载返回 401 / 403：** 仓库通过 GitHub Packages 下载依赖，保留了 `GITHUB_ACTOR`、`GITHUB_TOKEN` 和 `packages: read` 配置。实际能否访问仍由依赖包的权限决定，按日志核查。
+- **提示自定义签名配置不完整：** 默认模式不需要签名 Secrets。如果之前填过一部分，删除所有 `SIGNING_*` Secrets 即可。
+- **需要正常签名校验下的覆盖更新：** 使用下面的可选固定签名配置。默认 debug 签名不保证跨次构建一致。
+
+## 可选：使用自己的固定签名
+
+只有需要固定签名时才需要这一节；默认的自动 debug 签名无需以下配置。
 
 签名密钥是你的 APK 的身份凭证。自己的后续版本需要沿用同一把密钥，才能按 Android 的正常规则覆盖更新。
 请长期备份密钥文件和密码；不要在每次构建时重新生成。
@@ -67,36 +100,10 @@ base64 < installerx-personal.p12 | tr -d '\n' > installerx-personal.base64
 | `SIGNING_KEY_ALIAS` | `installerx` |
 | `SIGNING_KEY_PASSWORD` | 与 `SIGNING_STORE_PASSWORD` 相同的密码 |
 
-使用已有密钥时，填写它实际的别名和密码。密钥缺失、密码或别名不正确时，构建会失败，不会默默改用临时 debug 签名。
+使用已有密钥时，填写它实际的别名和密码。四项全部配置后才会启用自定义签名；只配置一部分或填写错误时会明确报错。
+要恢复自动 debug 签名，删除这四项 `SIGNING_*` Secrets 即可。
 
 工作流仅将密钥解码到 runner 临时目录，构建结束后删除。不会把密钥作为 artifact 上传，也不会发送到 Telegram。
-
-### 3. 手动构建
-
-1. 打开本仓库的 **Actions**。如果 fork 的工作流尚未启用，按 GitHub 的提示启用。
-2. 选择 **Manual AOSP Build → Run workflow**，选择 `main` 并运行。
-3. 等待上游合并和构建完成。Bot 会把 `PackageInstaller.apk` 发到你的私聊，附带版本和上游提交号。
-4. Telegram 配置验证成功后，如果后续合并、签名、构建或发送失败，会尽力向同一个私聊发送日志链接；发送失败会让工作流显示失败。
-
-无需手动创建发布或模块模板分支。
-
-## 上游同步与版本
-
-合并仅发生在本次 Actions 的工作目录，不会自动提交或推送到你的 `main`。
-应用源码按 Git 的正常合并规则更新；本 fork 的 `.github/` 自动化配置始终保留，包括已删除的自动发布工作流。
-其他路径发生冲突时立即停止，需要先在 fork 中解决冲突再运行，不会继续用旧源码构建。
-
-沿用原 fork 的版本格式：`222222.33 (YYYYMMDD)`，versionCode 为 `YYYYMMDD`，日期使用北京时间。
-两次同日构建使用相同的 versionCode；原工作流也是这一规则。
-最新上游源码按 Stable 构建类型编译，并不表示这些上游提交已经通过正式稳定版发布验证。
-
-## 常见问题
-
-- **Bot 无法联系你：** 确认你已私聊发送 `/start`，没有屏蔽 Bot，且 `CHAT_ID` 是自己的个人 ID。
-- **APK 太大：** 当前使用 Telegram 官方托管 Bot API，单个文件最多 50 MB。超过限制会明确失败，不会改为投递到其他地方。
-- **依赖下载返回 401 / 403：** 仓库通过 GitHub Packages 下载依赖，保留了 `GITHUB_ACTOR`、`GITHUB_TOKEN` 和 `packages: read` 配置。实际能否访问仍由依赖包的权限决定，按日志核查。
-- **找不到 keytool：** 安装 JDK，并把其 `bin` 目录加入 PATH；也可直接使用该目录下的 `keytool` / `keytool.exe`。
-- **签名不同导致无法覆盖安装：** 沿用已安装版本的签名密钥；新生成的个人密钥不能模拟原系统或原作者的签名。
 
 ## 原项目与参考资料
 
