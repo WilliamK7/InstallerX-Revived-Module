@@ -113,7 +113,8 @@ jobs:
           build-scan-terms-of-use-url: "https://gradle.com/help/legal-terms-of-use"
           build-scan-terms-of-use-agree: "yes"
           build-scan-publish: false
-          cache-read-only: true
+          # Persist reusable Gradle state for subsequent manual builds.
+          cache-read-only: false
 
       - name: Decode and validate signing key
         if: ${{ steps.signing.outputs.custom == 'true' }}
