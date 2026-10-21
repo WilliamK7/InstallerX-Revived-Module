@@ -84,7 +84,9 @@ jobs:
           git merge --no-commit --no-ff upstream/main || MERGE_STATUS=$?
 
           # Keep this fork's workflows and private-chat sender, including deletions.
-          # Upstream automation changes must not replace the personal build setup.
+          # Clear merge stages first: restore alone cannot resolve modify/delete
+          # conflicts for workflows that are absent from the fork's snapshot.
+          git rm -r -f --ignore-unmatch -- .github/
           git restore --source="$FORK_SHA" --staged --worktree -- .github/
 
           if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
